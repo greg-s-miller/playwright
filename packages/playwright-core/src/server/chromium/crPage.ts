@@ -723,10 +723,40 @@ class FrameSession {
       const frame = this._page.frameManager.frame(frameId);
       if (frame)
         this._page.frameManager.removeChildFramesRecursively(frame);
+      // An Electron <webview> guest becomes a top-level target, never an iframe target, so nothing
+      // takes this frame over. Without this it stays in the tree forever without an execution context.
+      if (frame && frame.parentFrame())
+        this._detachIfWebviewSwap(frameId, frame).catch(() => {});
       return;
     }
     // Just a regular frame detach.
     this._page.frameManager.frameDetached(frameId);
+  }
+
+  private async _detachIfWebviewSwap(frameId: string, frame: frames.Frame) {
+    if (!await this._isOwnedByWebview(frameId))
+      return;
+    // The frame has been taken over by an iframe target (see _onAttachedToTarget), or it is gone already.
+    if (this._crPage._sessions.has(frameId) || this._page.frameManager.frame(frameId) !== frame)
+      return;
+    this._page.frameManager.frameDetached(frameId);
+  }
+
+  private async _isOwnedByWebview(frameId: string): Promise<boolean> {
+    try {
+      // The owner of a <webview> guest frame is an <iframe> in the shadow root of the <webview> element.
+      const { backendNodeId } = await this._client.send('DOM.getFrameOwner', { frameId });
+      const { object } = await this._client.send('DOM.resolveNode', { backendNodeId });
+      const { result } = await this._client.send('Runtime.callFunctionOn', {
+        objectId: object.objectId,
+        functionDeclaration: `function() { const host = this.getRootNode().host; return !!host && host.localName === 'webview'; }`,
+        returnByValue: true,
+      });
+      this._client._sendMayFail('Runtime.releaseObject', { objectId: object.objectId! });
+      return result.value === true;
+    } catch (e) {
+      return false;
+    }
   }
 
   _onExecutionContextCreated(contextPayload: Protocol.Runtime.ExecutionContextDescription) {
